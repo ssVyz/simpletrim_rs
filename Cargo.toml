@@ -1,0 +1,10 @@
+[package]
+name = "simpletrim_rs"
+version = "0.0.1"
+edition = "2024"
+
+[[bin]]
+name = "simpletrim"
+path = "src/main.rs"
+
+[dependencies]
