@@ -251,13 +251,13 @@ fn check_known_adapters(seqs: &[Vec<u8>]) -> Option<Detected> {
     (frequent && seq.len() > 8).then(|| known(seq, name))
 }
 
-const KEYLEN: usize = 10;
-const KEY_SPACE: usize = 1 << (KEYLEN * 2);
+pub const KEYLEN: usize = 10;
+pub const KEY_SPACE: usize = 1 << (KEYLEN * 2);
 
 fn base_code(b: u8) -> Option<usize> {
     match b {
         b'A' => Some(0),
-        b'T' => Some(1),
+        b'T' | b'U' => Some(1),
         b'C' => Some(2),
         b'G' => Some(3),
         _ => None,
@@ -266,7 +266,7 @@ fn base_code(b: u8) -> Option<usize> {
 
 /// Rolling 2-bit encoding of `seq[pos..pos + KEYLEN]` (fastp `seq2int`); `last` is the key
 /// at `pos - 1` or `None` to compute from scratch. Returns `None` if the window has an N.
-fn seq2int(seq: &[u8], pos: usize, last: Option<usize>) -> Option<usize> {
+pub fn seq2int(seq: &[u8], pos: usize, last: Option<usize>) -> Option<usize> {
     match last {
         Some(prev) => {
             let mask = KEY_SPACE - 1;
@@ -278,7 +278,7 @@ fn seq2int(seq: &[u8], pos: usize, last: Option<usize>) -> Option<usize> {
     }
 }
 
-fn int2seq(mut key: usize) -> Vec<u8> {
+pub fn int2seq(mut key: usize) -> Vec<u8> {
     const BASES: [u8; 4] = [b'A', b'T', b'C', b'G'];
     let mut out = vec![b'N'; KEYLEN];
     for i in (0..KEYLEN).rev() {

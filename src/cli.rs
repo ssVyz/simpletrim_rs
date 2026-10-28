@@ -40,9 +40,9 @@ pub struct Cli {
 pub enum Command {
     /// Trim Illumina-style short reads (single-end, or paired-end with --r2)
     Short(Box<ShortArgs>),
-    /// Trim long reads such as Oxford Nanopore (not implemented yet)
-    Long(LongArgs),
-    /// Inspect input files and suggest settings for `simpletrim short`
+    /// Trim long reads (Oxford Nanopore, PacBio)
+    Long(Box<LongArgs>),
+    /// Inspect input files and suggest settings for `simpletrim short` or `simpletrim long`
     Analyze(AnalyzeArgs),
 }
 
@@ -64,6 +64,33 @@ impl OrphanMode {
             OrphanMode::KeepBoth => "keep-both",
             OrphanMode::Orphan => "orphan",
         }
+    }
+}
+
+/// What `long` does with low-quality stretches inside reads.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum LowQualityMode {
+    /// Remove the stretches; every remaining piece becomes a read of its own
+    Split,
+    /// Remove the stretches and keep only the longest remaining piece
+    Longest,
+}
+
+impl LowQualityMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            LowQualityMode::Split => "split",
+            LowQualityMode::Longest => "longest",
+        }
+    }
+}
+
+fn parse_percent(s: &str) -> Result<f64, String> {
+    let v: f64 = s.parse().map_err(|_| format!("'{s}' is not a number"))?;
+    if (0.0..=100.0).contains(&v) {
+        Ok(v)
+    } else {
+        Err(format!("{v} is not between 0 and 100"))
     }
 }
 
@@ -253,6 +280,14 @@ pub struct ShortArgs {
     #[arg(long, value_name = "N", default_value_t = 10, value_parser = clap::value_parser!(u16).range(1..), help_heading = "Poly-G trimming")]
     pub poly_g_min_len: u16,
 
+    /// Trim homopolymer tails of any base from the 3' end (after adapter trimming)
+    #[arg(long, help_heading = "Poly-X trimming")]
+    pub trim_poly_x: bool,
+
+    /// Minimum poly-X tail length
+    #[arg(long, value_name = "N", default_value_t = 10, value_parser = clap::value_parser!(u16).range(1..), help_heading = "Poly-X trimming")]
+    pub poly_x_min_len: u16,
+
     /// Disable adapter trimming (and the adapter dimer check)
     #[arg(long, help_heading = "Adapter trimming")]
     pub disable_adapter_trimming: bool,
@@ -371,10 +406,247 @@ pub struct ShortArgs {
     pub max_length: usize,
 }
 
+/// Options of `long`. Defaults follow fastplong; window and read means of quality values
+/// average error probabilities.
 #[derive(Args, Debug)]
 pub struct LongArgs {
-    #[arg(trailing_var_arg = true, allow_hyphen_values = true, hide = true)]
-    pub args: Vec<String>,
+    /// Input (FASTQ, gzip-compressed if the name ends in .gz)
+    #[arg(short = 'i', long, value_name = "FILE", help_heading = "Input/output")]
+    pub input: PathBuf,
+
+    /// Output (gzip-compressed if the name ends in .gz)
+    #[arg(short = 'o', long, value_name = "FILE", help_heading = "Input/output")]
+    pub output: PathBuf,
+
+    /// Also write reads and read pieces that fail, with the reason appended to the read name
+    #[arg(long, value_name = "FILE", help_heading = "Input/output")]
+    pub failed_output: Option<PathBuf>,
+
+    /// Write the final summary as a JSON file
+    #[arg(long, value_name = "FILE", help_heading = "Input/output")]
+    pub report: Option<PathBuf>,
+
+    /// Overwrite existing output files
+    #[arg(long, help_heading = "Input/output")]
+    pub force: bool,
+
+    /// gzip compression level for .gz outputs (1 = fastest, 9 = smallest)
+    #[arg(long, default_value_t = 4, value_parser = clap::value_parser!(u32).range(1..=9), help_heading = "Input/output")]
+    pub compression_level: u32,
+
+    /// Only process the first N reads; 0 processes everything
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 0,
+        help_heading = "Input/output"
+    )]
+    pub max_reads: u64,
+
+    /// Seconds between progress reports; 0 disables them
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value_t = 5.0,
+        help_heading = "Input/output"
+    )]
+    pub progress_interval: f64,
+
+    /// Bases to trim from the 5' end
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 0,
+        help_heading = "Fixed trimming"
+    )]
+    pub trim_front: usize,
+
+    /// Bases to trim from the 3' end
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 0,
+        help_heading = "Fixed trimming"
+    )]
+    pub trim_tail: usize,
+
+    /// Slide a window from the 5' end and drop bases while the window mean quality is too low
+    #[arg(long, help_heading = "Sliding window quality trimming")]
+    pub cut_front: bool,
+
+    /// Slide a window from the 3' end and drop bases while the window mean quality is too low
+    #[arg(long, help_heading = "Sliding window quality trimming")]
+    pub cut_tail: bool,
+
+    /// Window size for both cut modes
+    #[arg(long, value_name = "N", default_value_t = 4, value_parser = clap::value_parser!(u16).range(1..=1000), help_heading = "Sliding window quality trimming")]
+    pub cut_window_size: u16,
+
+    /// Required mean quality for both cut modes (error-probability mean; Q17 corresponds to
+    /// fastplong's Q20 for plain means)
+    #[arg(long, value_name = "Q", default_value_t = 17, value_parser = clap::value_parser!(u8).range(1..=36), help_heading = "Sliding window quality trimming")]
+    pub cut_mean_quality: u8,
+
+    /// Window size for --cut-front [default: --cut-window-size]
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u16).range(1..=1000), help_heading = "Sliding window quality trimming")]
+    pub cut_front_window_size: Option<u16>,
+
+    /// Mean quality for --cut-front [default: --cut-mean-quality]
+    #[arg(long, value_name = "Q", value_parser = clap::value_parser!(u8).range(1..=36), help_heading = "Sliding window quality trimming")]
+    pub cut_front_mean_quality: Option<u8>,
+
+    /// Window size for --cut-tail [default: --cut-window-size]
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u16).range(1..=1000), help_heading = "Sliding window quality trimming")]
+    pub cut_tail_window_size: Option<u16>,
+
+    /// Mean quality for --cut-tail [default: --cut-mean-quality]
+    #[arg(long, value_name = "Q", value_parser = clap::value_parser!(u8).range(1..=36), help_heading = "Sliding window quality trimming")]
+    pub cut_tail_mean_quality: Option<u8>,
+
+    /// Trim homopolymer tails of any base from the 3' end (before adapter trimming, as fastplong)
+    #[arg(long, help_heading = "Poly-X trimming")]
+    pub trim_poly_x: bool,
+
+    /// Minimum poly-X tail length
+    #[arg(long, value_name = "N", default_value_t = 10, value_parser = clap::value_parser!(u16).range(1..), help_heading = "Poly-X trimming")]
+    pub poly_x_min_len: u16,
+
+    /// Disable adapter trimming (also disables chimera splitting)
+    #[arg(long, help_heading = "Adapter trimming")]
+    pub disable_adapter_trimming: bool,
+
+    /// Adapter at the read start (5'): a sequence, `auto` (detect) or `none`
+    #[arg(
+        short = 's',
+        long,
+        value_name = "SEQ|auto|none",
+        default_value = "auto",
+        help_heading = "Adapter trimming"
+    )]
+    pub start_adapter: String,
+
+    /// Adapter at the read end (3'): a sequence, `auto` or `none` [default: the reverse
+    /// complement of a given --start-adapter, otherwise detected]
+    #[arg(
+        short = 'e',
+        long,
+        value_name = "SEQ|auto|none",
+        default_value = "auto",
+        help_heading = "Adapter trimming"
+    )]
+    pub end_adapter: String,
+
+    /// FASTA file with additional sequences, trimmed at both read ends and searched inside reads
+    #[arg(long, value_name = "FILE", help_heading = "Adapter trimming")]
+    pub adapter_fasta: Option<PathBuf>,
+
+    /// Allowed edits (substitutions, insertions, deletions) per adapter base at the read ends
+    #[arg(long, value_name = "RATE", default_value_t = 0.25, value_parser = parse_rate, help_heading = "Adapter trimming")]
+    pub distance_threshold: f64,
+
+    /// Minimum adapter overlap with the read when the read starts or ends inside the adapter
+    #[arg(long, value_name = "N", default_value_t = 16, value_parser = clap::value_parser!(u16).range(1..), help_heading = "Adapter trimming")]
+    pub adapter_min_overlap: u16,
+
+    /// Bases searched for adapters at each read end
+    #[arg(long, value_name = "N", default_value_t = 200, value_parser = clap::value_parser!(u32).range(10..), help_heading = "Adapter trimming")]
+    pub adapter_window: u32,
+
+    /// Extra bases removed next to every adapter found, for a clean cut
+    #[arg(long, value_name = "N", default_value_t = 10, value_parser = clap::value_parser!(u16).range(0..=100), help_heading = "Adapter trimming")]
+    pub trimming_extension: u16,
+
+    /// Do not split reads at adapters found inside them
+    #[arg(long, help_heading = "Chimeric reads")]
+    pub disable_chimera_splitting: bool,
+
+    /// Discard reads with an adapter inside instead of splitting them
+    #[arg(
+        long,
+        conflicts_with = "disable_chimera_splitting",
+        help_heading = "Chimeric reads"
+    )]
+    pub discard_chimeric_reads: bool,
+
+    /// Minimum length of a piece kept after splitting at internal adapters
+    #[arg(long, value_name = "N", default_value_t = 20, value_parser = clap::value_parser!(u32).range(1..), help_heading = "Chimeric reads")]
+    pub chimera_min_segment_length: u32,
+
+    /// Allowed edits per adapter base for adapters inside reads (stricter than at the ends,
+    /// because the whole read is searched)
+    #[arg(long, value_name = "RATE", default_value_t = 0.15, value_parser = parse_rate, help_heading = "Chimeric reads")]
+    pub chimera_distance_threshold: f64,
+
+    /// Remove low-quality stretches inside reads: `split` keeps every remaining piece as a read
+    /// of its own (named <id>_1, <id>_2, ...), `longest` keeps only the longest piece [default: off]
+    #[arg(
+        long,
+        value_enum,
+        value_name = "MODE",
+        help_heading = "Low-quality stretches"
+    )]
+    pub low_quality_mode: Option<LowQualityMode>,
+
+    /// Window size for finding low-quality stretches
+    #[arg(long, value_name = "N", default_value_t = 100, value_parser = clap::value_parser!(u32).range(5..=1_000_000), help_heading = "Low-quality stretches")]
+    pub low_quality_window: u32,
+
+    /// Windows with a mean quality below this are low quality (error-probability mean; Q7
+    /// corresponds to fastplong's Q10 for plain means)
+    #[arg(long, value_name = "Q", default_value_t = 7, value_parser = clap::value_parser!(u8).range(1..=30), help_heading = "Low-quality stretches")]
+    pub low_quality_threshold: u8,
+
+    /// Disable the read quality filter
+    #[arg(long, help_heading = "Filters")]
+    pub disable_quality_filter: bool,
+
+    /// Phred quality from which a base counts as qualified
+    #[arg(long, value_name = "Q", default_value_t = 15, value_parser = clap::value_parser!(u8).range(0..=93), help_heading = "Filters")]
+    pub qualified_quality: u8,
+
+    /// Maximum percentage of unqualified bases
+    #[arg(long, value_name = "PERCENT", default_value_t = 40, value_parser = clap::value_parser!(u32).range(0..=100), help_heading = "Filters")]
+    pub unqualified_percent_limit: u32,
+
+    /// Maximum percentage of N bases
+    #[arg(long, value_name = "PERCENT", default_value_t = 10, value_parser = clap::value_parser!(u32).range(0..=100), help_heading = "Filters")]
+    pub n_percent_limit: u32,
+
+    /// Maximum number of N bases [default: no limit]
+    #[arg(long, value_name = "N", help_heading = "Filters")]
+    pub n_base_limit: Option<usize>,
+
+    /// Minimum mean read quality (error-probability mean); 0 disables this check
+    #[arg(long, value_name = "Q", default_value_t = 0, value_parser = clap::value_parser!(u8).range(0..=93), help_heading = "Filters")]
+    pub average_quality: u8,
+
+    /// Minimum GC content in percent [default: no limit]
+    #[arg(long, value_name = "PERCENT", value_parser = parse_percent, help_heading = "Filters")]
+    pub min_gc: Option<f64>,
+
+    /// Maximum GC content in percent [default: no limit]
+    #[arg(long, value_name = "PERCENT", value_parser = parse_percent, help_heading = "Filters")]
+    pub max_gc: Option<f64>,
+
+    /// Discard low-complexity reads (too few bases that differ from the next base)
+    #[arg(long, help_heading = "Filters")]
+    pub low_complexity_filter: bool,
+
+    /// Minimum percentage of bases that differ from the next base
+    #[arg(long, value_name = "PERCENT", default_value_t = 30, value_parser = clap::value_parser!(u32).range(0..=100), help_heading = "Filters")]
+    pub complexity_threshold: u32,
+
+    /// Disable the length filter
+    #[arg(long, help_heading = "Filters")]
+    pub disable_length_filter: bool,
+
+    /// Discard reads (pieces) shorter than this after trimming
+    #[arg(long, value_name = "N", default_value_t = 20, help_heading = "Filters")]
+    pub min_length: usize,
+
+    /// Discard reads (pieces) longer than this after trimming; 0 means no limit
+    #[arg(long, value_name = "N", default_value_t = 0, help_heading = "Filters")]
+    pub max_length: usize,
 }
 
 #[derive(Args, Debug)]
@@ -390,6 +662,10 @@ pub struct AnalyzeArgs {
     /// Number of reads (pairs) to inspect from the start of the input; 0 reads everything
     #[arg(long, value_name = "N", default_value_t = 1_000_000)]
     pub max_reads: u64,
+
+    /// Long reads: stop after this many bases; 0 means no limit
+    #[arg(long, value_name = "N", default_value_t = 500_000_000)]
+    pub max_bases: u64,
 }
 
 #[cfg(test)]
@@ -437,6 +713,43 @@ mod tests {
         assert!(
             Cli::try_parse_from(["simpletrim", "short", "--r1", "a", "--o1", "b", "--r2", "c"])
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn parses_long_command() {
+        let cli = Cli::try_parse_from([
+            "simpletrim",
+            "long",
+            "-i",
+            "in.fq.gz",
+            "-o",
+            "out.fq.gz",
+            "--low-quality-mode",
+            "split",
+            "-s",
+            "ACGTACGTAC",
+        ])
+        .unwrap();
+        let Command::Long(args) = cli.command else {
+            panic!("expected long");
+        };
+        assert_eq!(args.low_quality_mode, Some(LowQualityMode::Split));
+        assert_eq!(args.start_adapter, "ACGTACGTAC");
+        assert_eq!(args.end_adapter, "auto");
+        assert_eq!(args.min_length, 20);
+        assert!(
+            Cli::try_parse_from([
+                "simpletrim",
+                "long",
+                "-i",
+                "a",
+                "-o",
+                "b",
+                "--discard-chimeric-reads",
+                "--disable-chimera-splitting"
+            ])
+            .is_err()
         );
     }
 }

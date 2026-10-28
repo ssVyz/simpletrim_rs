@@ -78,6 +78,42 @@ impl Record<'_> {
         self.write_trimmed(0, self.seq.len(), out);
     }
 
+    /// Appends bases `[start, end)` as a record. With `piece`, `_<piece>` is appended to the
+    /// read id (before any comment); with `tag`, ` <tag>` is appended to the header line.
+    pub fn write_piece(
+        &self,
+        start: usize,
+        end: usize,
+        piece: Option<usize>,
+        tag: Option<&str>,
+        out: &mut Vec<u8>,
+    ) {
+        match piece {
+            Some(n) => {
+                let id_end = self
+                    .name
+                    .iter()
+                    .position(|b| b.is_ascii_whitespace())
+                    .unwrap_or(self.name.len());
+                out.extend_from_slice(&self.name[..id_end]);
+                out.extend_from_slice(format!("_{n}").as_bytes());
+                out.extend_from_slice(&self.name[id_end..]);
+            }
+            None => out.extend_from_slice(self.name),
+        }
+        if let Some(tag) = tag {
+            out.push(b' ');
+            out.extend_from_slice(tag.as_bytes());
+        }
+        out.push(b'\n');
+        out.extend_from_slice(&self.seq[start..end]);
+        out.push(b'\n');
+        out.extend_from_slice(self.plus);
+        out.push(b'\n');
+        out.extend_from_slice(&self.qual[start..end]);
+        out.push(b'\n');
+    }
+
     /// Read name without `@`, cut at the first whitespace.
     pub fn id(&self) -> &[u8] {
         let name = self.name.strip_prefix(b"@").unwrap_or(self.name);
@@ -219,14 +255,15 @@ impl FastqReader {
     }
 }
 
-/// Reads chunks of `chunk_records` records and sends them until the input ends, `limit`
-/// records were read (0 = no limit) or the receiver hangs up. A read error is sent as the
-/// last message. Meant to run on its own thread.
+/// Reads chunks of at most `chunk_records` records (and about `chunk_bytes` bytes) and sends
+/// them until the input ends, `limit` records were read (0 = no limit) or the receiver hangs
+/// up. A read error is sent as the last message. Meant to run on its own thread.
 pub fn feed_chunks(
     mut reader: FastqReader,
     tx: SyncSender<Result<Chunk>>,
     limit: u64,
     chunk_records: usize,
+    chunk_bytes: usize,
 ) {
     loop {
         let wanted = if limit == 0 {
@@ -237,7 +274,7 @@ pub fn feed_chunks(
         if wanted == 0 {
             return;
         }
-        match reader.read_chunk(wanted, usize::MAX) {
+        match reader.read_chunk(wanted, chunk_bytes) {
             Ok(Some(chunk)) => {
                 if tx.send(Ok(chunk)).is_err() {
                     return;
@@ -281,6 +318,28 @@ mod tests {
         assert_eq!(c.get(0).seq, b"T");
         assert!(r.read_chunk(2, usize::MAX).unwrap().is_none());
         assert_eq!(r.records_read(), 3);
+    }
+
+    #[test]
+    fn writes_pieces_with_suffix_and_tag() {
+        let mut r = reader("@id\tqs:f:12.5 x\nACGTACGT\n+\nIIIIHHHH\n");
+        let c = r.read_chunk(1, usize::MAX).unwrap().unwrap();
+        let mut out = Vec::new();
+        c.get(0).write_piece(2, 6, Some(2), None, &mut out);
+        c.get(0)
+            .write_piece(0, 2, None, Some("failed_too_short"), &mut out);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            "@id_2\tqs:f:12.5 x\nGTAC\n+\nIIHH\n@id\tqs:f:12.5 x failed_too_short\nAC\n+\nII\n"
+        );
+    }
+
+    #[test]
+    fn byte_limited_chunks() {
+        let mut r = reader("@a\nACGT\n+\nIIII\n@b\nACGT\n+\nIIII\n@c\nA\n+\nI\n");
+        // the chunk ends once it holds at least 20 bytes
+        assert_eq!(r.read_chunk(100, 20).unwrap().unwrap().len(), 2);
+        assert_eq!(r.read_chunk(100, 20).unwrap().unwrap().len(), 1);
     }
 
     #[test]

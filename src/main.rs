@@ -4,18 +4,27 @@ mod adapter;
 mod analyze;
 mod cli;
 mod detect;
+mod edit;
 mod fastq;
 mod filter;
 mod io;
 mod known_adapters;
 mod log;
+mod long;
+mod long_adapter;
+mod long_detect;
 mod matcher;
 mod overlap;
+mod pipeline;
 mod platform;
 mod polyg;
+mod polyx;
 mod quality;
 mod short;
 mod stats;
+#[cfg(test)]
+#[path = "../tests/common/synth.rs"]
+mod synth;
 
 use std::process::ExitCode;
 
@@ -52,9 +61,7 @@ fn main() -> ExitCode {
     let result = match &cli.command {
         Command::Short(args) => short::run(args, threads, &log),
         Command::Analyze(args) => analyze::run(args, threads, &log),
-        Command::Long(_) => {
-            Err("the 'long' subcommand (long-read trimming) is not implemented yet".into())
-        }
+        Command::Long(args) => long::run(args, threads, &log),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

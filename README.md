@@ -4,8 +4,9 @@ A small, portable NGS read trimmer written in Rust. It is configured entirely fr
 line (no config files, no environment variables), which makes it easy to call from other
 programs.
 
-**Status:** stage 1. Short reads (Illumina-style, single-end and paired-end) are supported.
-Long-read (Oxford Nanopore) trimming is planned; `analyze` already recognises ONT input.
+**Status:** stage 2. Short reads (Illumina-style, single-end and paired-end) and long reads
+(Oxford Nanopore, PacBio) are supported. Long-read trimming has so far been tested on synthetic
+reads and one small nanopore run.
 
 ## AI disclosure
 
@@ -26,8 +27,12 @@ simpletrim short --r1 in_R1.fastq.gz --r2 in_R2.fastq.gz --o1 out_R1.fastq.gz --
 # Single-end trimming
 simpletrim short --r1 in.fastq.gz --o1 out.fastq.gz
 
-# Inspect the input and get a suggested `simpletrim short` command
+# Long reads (nanopore, PacBio)
+simpletrim long -i reads.fastq.gz -o trimmed.fastq.gz
+
+# Inspect the input and get a suggested `simpletrim short` or `simpletrim long` command
 simpletrim analyze --r1 in_R1.fastq.gz --r2 in_R2.fastq.gz
+simpletrim analyze --r1 reads.fastq.gz
 ```
 
 `simpletrim short` applies these steps in order, and each one can be switched off:
@@ -45,15 +50,44 @@ For paired-end data, mate names are checked. `--orphan-mode discard|keep-both|or
 what happens when only one mate passes. Run `simpletrim short --help` for all options and
 defaults.
 
+`simpletrim long` applies these steps in order:
+
+1. Fixed front/tail trimming.
+2. Sliding-window quality cutting (`--cut-front`, `--cut-tail`; off by default).
+3. Poly-X tail trimming (`--trim-poly-x`; off by default).
+4. Adapter trimming at the read start and end, also when the read starts or ends inside the
+   adapter. Adapters are auto-detected unless given (`--start-adapter`, `--end-adapter`,
+   `--adapter-fasta`). Matching uses edit distance, so insertions and deletions are tolerated.
+5. Chimeric reads: reads are split where an adapter is found inside them
+   (`--discard-chimeric-reads` drops them instead, `--disable-chimera-splitting` keeps them).
+6. Low-quality stretches inside reads (`--low-quality-mode split|longest`; off by default):
+   `split` writes every good piece as a read of its own, `longest` keeps only the longest
+   piece.
+7. Quality, length and optional GC and complexity filters, applied to every piece.
+
+Pieces of a split read are named `<id>_1`, `<id>_2`, ... (read order); the rest of the header
+is kept. `--failed-output FILE` collects reads and pieces that fail, with the reason appended
+to the name. Quality means average error probabilities, as is usual for nanopore data.
+
 ### Calling from other programs
 
 - `--json` writes progress and results as one JSON object per line on stderr. The `analyze`
   report is printed on stdout (as JSON with `--json`).
-- `--report FILE` saves the run summary of `short` as JSON.
+- `--report FILE` saves the run summary of `short` or `long` as JSON.
 - Exit codes: `0` success, `1` error, `2` invalid command line.
 - Existing output files are never overwritten unless `--force` is given. Outputs of a failed
   run are removed.
 - `-w/--threads` sets the number of worker threads (default 3).
+
+### Synthetic test data
+
+The long-read tests use synthetic nanopore-like reads with a known structure
+(`tests/common/synth.rs`). A larger reference set (about 185 Mbp, with a truth table of insert
+and low-quality positions) can be written to `examples/` with:
+
+```sh
+cargo test --release --test long reference_dataset -- --ignored
+```
 
 ## Acknowledgements
 
@@ -86,7 +120,23 @@ and maintaining fastp. If simpletrim is useful in your work, please also cite fa
   preprocessor. *Bioinformatics* 34.17 (2018): i884–i890.
   <https://doi.org/10.1093/bioinformatics/bty560>
 
+### fastplong
 
+`simpletrim long` was written using [fastplong](https://github.com/OpenGene/fastplong)
+(version 0.7.1, MIT License, by Shifu Chen and the OpenGene contributors) as a template, in
+the same way: its processing steps, adapter auto-detection, chimera splitting, low-quality
+segment handling, filters and defaults were taken from its source code and reimplemented in
+Rust. simpletrim is not affiliated with or endorsed by the fastplong authors. The deliberate
+differences (among them edit-distance adapter matching and quality means from error
+probabilities) are listed in [CHANGELOG.md](CHANGELOG.md).
+
+### Edit distance
+
+Adapters in long reads are found with the bit-parallel edit-distance algorithm of Gene Myers
+(in Heikki Hyyrö's formulation), implemented from the publication:
+
+- Gene Myers. A fast bit-vector algorithm for approximate string matching based on dynamic
+  programming. *Journal of the ACM* 46.3 (1999): 395–415. <https://doi.org/10.1145/316542.316550>
 
 ### Rust crates
 

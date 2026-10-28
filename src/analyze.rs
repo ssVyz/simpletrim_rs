@@ -1,6 +1,9 @@
-//! The `analyze` subcommand: inspects the inputs and suggests a `simpletrim short` command.
+//! The `analyze` subcommand: inspects the inputs and suggests a `simpletrim short` command,
+//! or for long reads a `simpletrim long` command (see [`long_reads`]).
 //!
 //! The report goes to stdout (text, or JSON with `--json`); progress messages go to stderr.
+
+mod long_reads;
 
 use std::io::Write;
 use std::path::Path;
@@ -18,7 +21,7 @@ use crate::fastq::{Chunk, Record, feed_chunks, mate_names_match};
 use crate::io::{self, is_gz};
 use crate::log::Logger;
 use crate::overlap::{self, OverlapParams};
-use crate::platform::{HeaderInfo, parse_header};
+use crate::platform::{HeaderInfo, Platform, parse_header};
 use crate::polyg::poly_g_trim_len;
 use crate::stats::{group, round};
 
@@ -408,27 +411,21 @@ fn emit(log: &Logger, text: &str, json: &Value) -> Result<()> {
         .map_err(|e| format!("cannot write report: {e}"))
 }
 
-/// Report for long-read input, whose analysis is not implemented yet.
-fn long_read_stub(args: &AnalyzeArgs, header: &HeaderInfo, log: &Logger) -> Result<()> {
-    let message = format!(
-        "{} long reads detected; long-read analysis is not implemented yet",
-        header.platform.label()
-    );
-    let text = format!(
-        "simpletrim analyze\n\nInput\n  R1: {}\n  Platform: {}\n\n{message}.\n\
-         Long-read trimming ('simpletrim long') will follow in a later version.\n",
-        args.r1.display(),
-        header.platform.label()
-    );
-    let json = json!({
-        "version": env!("CARGO_PKG_VERSION"),
-        "status": "not_implemented",
-        "message": message,
-        "inputs": { "r1": file_json(&args.r1), "r2": args.r2.as_deref().map(file_json) },
-        "platform": header_json(header),
-        "suggested_command": null,
-    });
-    emit(log, &text, &json)
+/// Reads that are this long (median of the first reads) are analysed as long reads even if
+/// the header does not tell the platform.
+const LONG_READ_MEDIAN: usize = 1000;
+const PEEK_READS: usize = 100;
+
+/// Header of the first read, its name, and the median length of the first reads.
+fn peek_start(path: &Path, label: &str) -> Result<Option<(HeaderInfo, Vec<u8>, usize)>> {
+    let mut input = io::open_fastq(path, label)?;
+    let Some(chunk) = input.reader.read_chunk(PEEK_READS, usize::MAX)? else {
+        return Ok(None);
+    };
+    let mut lens: Vec<usize> = chunk.iter().map(|r| r.seq.len()).collect();
+    lens.sort_unstable();
+    let name = chunk.get(0).name.to_vec();
+    Ok(Some((parse_header(&name), name, lens[lens.len() / 2])))
 }
 
 fn receive(rx: Option<&Receiver<Result<Chunk>>>) -> Result<Option<Chunk>> {
@@ -464,10 +461,13 @@ fn collect(args: &AnalyzeArgs, threads: usize, log: &Logger) -> Result<Collected
 
     std::thread::scope(|scope| {
         let (tx1, rx1) = sync_channel(batch_size);
-        scope.spawn(move || feed_chunks(in1.reader, tx1, args.max_reads, CHUNK_RECORDS));
+        scope
+            .spawn(move || feed_chunks(in1.reader, tx1, args.max_reads, CHUNK_RECORDS, usize::MAX));
         let rx2 = in2.map(|in2| {
             let (tx2, rx2) = sync_channel(batch_size);
-            scope.spawn(move || feed_chunks(in2.reader, tx2, args.max_reads, CHUNK_RECORDS));
+            scope.spawn(move || {
+                feed_chunks(in2.reader, tx2, args.max_reads, CHUNK_RECORDS, usize::MAX)
+            });
             rx2
         });
         let mut stats = Partial::new();
@@ -573,11 +573,13 @@ pub fn run(args: &AnalyzeArgs, threads: usize, log: &Logger) -> Result<()> {
             return Err("--r1 and --r2 point to the same file".into());
         }
     }
-    let Some(h1) = peek_header(&args.r1, "R1")? else {
+    let Some((h1, first_name, median_len)) = peek_start(&args.r1, "R1")? else {
         return Err(format!("{} contains no reads", args.r1.display()));
     };
-    if h1.platform.is_long_read() {
-        return long_read_stub(args, &h1, log);
+    if h1.platform.is_long_read()
+        || (h1.platform == Platform::Unknown && median_len >= LONG_READ_MEDIAN)
+    {
+        return long_reads::run(args, &h1, &first_name, threads, log);
     }
     let h2 = match &args.r2 {
         Some(p) => peek_header(p, "R2")?,
@@ -855,7 +857,7 @@ pub fn run(args: &AnalyzeArgs, threads: usize, log: &Logger) -> Result<()> {
     }
     let median_len = hist_quantile(&st.mates[0].len_hist, 0.5).unwrap_or(0);
     if median_len > 1000 {
-        warnings.push("reads are long (median > 1000 bp); this looks like long-read data, which 'short' is not meant for".into());
+        warnings.push("reads are long (median > 1000 bp); this looks like long-read data, for which 'simpletrim long' is meant".into());
     }
     if st.mates[..mates]
         .iter()

@@ -13,6 +13,7 @@ use flate2::write::GzEncoder;
 
 use crate::Result;
 use crate::fastq::FastqReader;
+use crate::log::Logger;
 
 /// Whether a path denotes gzip data, judged by its extension.
 pub fn is_gz(path: &Path) -> bool {
@@ -209,6 +210,52 @@ pub fn write_text_file(path: &Path, content: &str, force: bool) -> Result<()> {
         .map_err(|e| format!("cannot write {}: {e}", path.display()))?;
     files.commit();
     Ok(())
+}
+
+/// Reads a FASTA file of adapters (sequences of at least 6 bases, de-duplicated, as fastp and
+/// fastplong).
+pub fn load_adapter_fasta(path: &Path, log: &Logger) -> Result<Vec<Vec<u8>>> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("cannot read adapter FASTA {}: {e}", path.display()))?;
+    let mut records: Vec<(String, Vec<u8>)> = Vec::new();
+    for line in text.lines().map(str::trim) {
+        if let Some(name) = line.strip_prefix('>') {
+            records.push((name.trim().to_string(), Vec::new()));
+        } else if !line.is_empty() {
+            let Some((name, seq)) = records.last_mut() else {
+                return Err(format!(
+                    "adapter FASTA {}: sequence before the first '>' header",
+                    path.display()
+                ));
+            };
+            let upper = line.to_ascii_uppercase();
+            if let Some(c) = upper.chars().find(|c| !"ACGTN".contains(*c)) {
+                return Err(format!(
+                    "adapter FASTA {}: invalid base '{c}' in '{name}'",
+                    path.display()
+                ));
+            }
+            seq.extend_from_slice(upper.as_bytes());
+        }
+    }
+    let mut adapters: Vec<Vec<u8>> = Vec::new();
+    for (name, seq) in records {
+        if seq.len() < 6 {
+            log.warn(&format!(
+                "skipping adapter '{name}' from {}: shorter than 6 bases",
+                path.display()
+            ));
+        } else if !adapters.contains(&seq) {
+            adapters.push(seq);
+        }
+    }
+    if adapters.is_empty() {
+        return Err(format!(
+            "adapter FASTA {} has no usable sequences",
+            path.display()
+        ));
+    }
+    Ok(adapters)
 }
 
 #[cfg(test)]

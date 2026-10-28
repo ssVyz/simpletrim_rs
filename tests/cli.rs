@@ -560,10 +560,9 @@ fn usage_errors_exit_with_2() {
 }
 
 #[test]
-fn long_is_not_implemented() {
+fn long_requires_input_and_output() {
     let out = run(&["long", "--input", "x"]);
-    assert_eq!(out.status.code(), Some(1));
-    assert!(String::from_utf8_lossy(&out.stderr).contains("not implemented"));
+    assert_eq!(out.status.code(), Some(2));
 }
 
 #[test]
@@ -601,6 +600,14 @@ fn analyze_recognises_nanopore() {
     let out = run(&["analyze", "--r1", s(&input), "--json"]);
     assert!(out.status.success());
     let report: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
-    assert_eq!(report["status"], "not_implemented");
+    assert_eq!(report["status"], "ok");
+    assert_eq!(report["mode"], "long");
     assert_eq!(report["platform"]["platform"], "oxford_nanopore");
+    assert_eq!(report["platform"]["run"]["run_id"], "abc");
+    assert!(
+        report["suggested_command"]
+            .as_str()
+            .unwrap()
+            .starts_with("simpletrim long -i")
+    );
 }

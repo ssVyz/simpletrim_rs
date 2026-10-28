@@ -2,20 +2,13 @@
 //!
 //! Steps per read, in order (each can be disabled): fixed front/tail trimming, sliding-window
 //! quality cutting, poly-G tail trimming, adapter trimming (read overlap for pairs, then
-//! adapter sequences), adapter dimer check, quality and length filters.
+//! adapter sequences), adapter dimer check, poly-X tail trimming, quality and length filters.
 //!
 //! Data flow: one reader thread per input parses fixed-size chunks; chunks are processed and
 //! (for .gz outputs) compressed in parallel on the worker pool; a writer thread writes the
 //! results in input order.
 
-use std::collections::BTreeMap;
-use std::fs::File;
-use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::mpsc::{Receiver, SyncSender, channel, sync_channel};
-use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -23,15 +16,17 @@ use crate::Result;
 use crate::adapter::{MatchParams, trim_multi, trim_single};
 use crate::cli::{OrphanMode, ShortArgs};
 use crate::detect::{self, Detected};
-use crate::fastq::{Chunk, Record, feed_chunks, mate_names_match};
+use crate::fastq::{Chunk, Record, mate_names_match};
 use crate::filter::{self, Fate, LengthFilter, QualityFilter};
-use crate::io::{self, OutputFiles, gzip_member, is_gz};
+use crate::io::{self, OutputFiles};
 use crate::known_adapters;
 use crate::log::Logger;
 use crate::overlap::{self, OverlapParams};
+use crate::pipeline::{self, Sink};
 use crate::platform::{Platform, parse_header};
 use crate::polyg::poly_g_trim_len;
-use crate::quality::{QualityCut, Window, trim_and_cut};
+use crate::polyx::poly_x_trim_len;
+use crate::quality::{Averaging, QualityCut, Scale, Window, trim_and_cut};
 use crate::stats::{RunStats, TrimStats, group, percent};
 
 /// Records per chunk; both mates are read in chunks of the same size so pairs stay aligned.
@@ -108,6 +103,7 @@ pub struct Settings {
     cut: QualityCut,
     poly_g: Option<usize>,
     poly_g_reason: &'static str,
+    poly_x: Option<usize>,
     adapter: Option<AdapterSettings>,
     dimer_max_len: Option<usize>,
     quality_filter: Option<QualityFilter>,
@@ -116,8 +112,6 @@ pub struct Settings {
     check_names: bool,
     /// Output slot that receives read 2 orphans.
     orphan2_slot: usize,
-    /// Which output slots are gzip-compressed.
-    gz: [bool; SLOTS],
     compression_level: u32,
 }
 
@@ -131,51 +125,6 @@ fn window(
         size: size.unwrap_or(args.cut_window_size) as usize,
         quality: quality.unwrap_or(args.cut_mean_quality),
     })
-}
-
-/// Reads a FASTA file of adapters (sequences of at least 6 bases, de-duplicated, as fastp).
-fn load_adapter_fasta(path: &Path, log: &Logger) -> Result<Vec<Vec<u8>>> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read adapter FASTA {}: {e}", path.display()))?;
-    let mut records: Vec<(String, Vec<u8>)> = Vec::new();
-    for line in text.lines().map(str::trim) {
-        if let Some(name) = line.strip_prefix('>') {
-            records.push((name.trim().to_string(), Vec::new()));
-        } else if !line.is_empty() {
-            let Some((name, seq)) = records.last_mut() else {
-                return Err(format!(
-                    "adapter FASTA {}: sequence before the first '>' header",
-                    path.display()
-                ));
-            };
-            let upper = line.to_ascii_uppercase();
-            if let Some(c) = upper.chars().find(|c| !"ACGTN".contains(*c)) {
-                return Err(format!(
-                    "adapter FASTA {}: invalid base '{c}' in '{name}'",
-                    path.display()
-                ));
-            }
-            seq.extend_from_slice(upper.as_bytes());
-        }
-    }
-    let mut adapters: Vec<Vec<u8>> = Vec::new();
-    for (name, seq) in records {
-        if seq.len() < 6 {
-            log.warn(&format!(
-                "skipping adapter '{name}' from {}: shorter than 6 bases",
-                path.display()
-            ));
-        } else if !adapters.contains(&seq) {
-            adapters.push(seq);
-        }
-    }
-    if adapters.is_empty() {
-        return Err(format!(
-            "adapter FASTA {} has no usable sequences",
-            path.display()
-        ));
-    }
-    Ok(adapters)
 }
 
 fn peek_first_name(path: &Path, label: &str) -> Result<Option<Vec<u8>>> {
@@ -316,13 +265,6 @@ fn resolve_settings(args: &ShortArgs, log: &Logger) -> Result<Settings> {
     } else {
         ORPHAN1
     };
-    let gz_of = |p: &Option<PathBuf>| p.as_deref().is_some_and(is_gz);
-    let gz = [
-        is_gz(&args.o1),
-        gz_of(&args.o2),
-        gz_of(&args.orphan1),
-        gz_of(&args.orphan2),
-    ];
 
     Ok(Settings {
         paired,
@@ -331,6 +273,7 @@ fn resolve_settings(args: &ShortArgs, log: &Logger) -> Result<Settings> {
         cut,
         poly_g,
         poly_g_reason,
+        poly_x: args.trim_poly_x.then_some(args.poly_x_min_len as usize),
         dimer_max_len: (adapter.is_some() && !args.disable_dimer_check)
             .then_some(args.dimer_max_len),
         adapter,
@@ -339,7 +282,6 @@ fn resolve_settings(args: &ShortArgs, log: &Logger) -> Result<Settings> {
         orphan_mode: args.orphan_mode,
         check_names: !args.no_name_check,
         orphan2_slot,
-        gz,
         compression_level: args.compression_level,
     })
 }
@@ -440,7 +382,7 @@ fn resolve_adapters(args: &ShortArgs, paired: bool, log: &Logger) -> Result<Adap
     }
 
     let fasta = match &args.adapter_fasta {
-        Some(p) => load_adapter_fasta(p, log)?,
+        Some(p) => io::load_adapter_fasta(p, log)?,
         None => Vec::new(),
     };
     Ok(AdapterSettings {
@@ -471,7 +413,15 @@ fn trim_ends(
     st: &mut TrimStats,
 ) -> Option<(usize, usize)> {
     let len = rec.seq.len();
-    let kept = trim_and_cut(rec.seq, rec.qual, s.front[mate], s.tail[mate], &s.cut);
+    let phred = Scale::get(Averaging::Phred);
+    let kept = trim_and_cut(
+        rec.seq,
+        rec.qual,
+        s.front[mate],
+        s.tail[mate],
+        &s.cut,
+        phred,
+    );
     let fixed = (s.front[mate] + s.tail[mate]).min(len);
     st.fixed.add(fixed);
     st.quality_window
@@ -511,6 +461,16 @@ fn trim_adapter_sequences(
     trimmed
 }
 
+/// Poly-X tail trimming (after adapter trimming, as in fastp).
+fn trim_poly_x(s: &Settings, rec: &Record, kept: &mut Option<(usize, usize)>, st: &mut TrimStats) {
+    if let (Some(min_len), Some(region)) = (s.poly_x, kept.as_mut())
+        && let Some(new_len) = poly_x_trim_len(&rec.seq[region.0..region.1], min_len)
+    {
+        st.poly_x.add(region.1 - region.0 - new_len);
+        region.1 = region.0 + new_len;
+    }
+}
+
 fn fate_of(s: &Settings, rec: &Record, kept: Option<(usize, usize)>) -> Fate {
     match kept {
         None => Fate::TooShort,
@@ -537,6 +497,7 @@ fn process_single(s: &Settings, rec: &Record, st: &mut RunStats, out: &mut [Vec<
                 .is_some_and(|max| region.1 - region.0 <= max);
         }
     }
+    trim_poly_x(s, rec, &mut kept, &mut st.trim[0]);
     let fate = if dimer {
         Fate::AdapterDimer
     } else {
@@ -598,6 +559,9 @@ fn process_pair(
         if let (Some(max), [Some(k1), Some(k2)]) = (s.dimer_max_len, kept) {
             dimer = (trimmed[0] || trimmed[1]) && k1.1 - k1.0 <= max && k2.1 - k2.0 <= max;
         }
+    }
+    for m in 0..2 {
+        trim_poly_x(s, recs[m], &mut kept[m], &mut st.trim[m]);
     }
 
     let fates = if dimer {
@@ -661,37 +625,23 @@ fn process_pair(
     }
 }
 
-struct Job {
-    index: usize,
-    r1: Chunk,
-    r2: Option<Chunk>,
-}
-
-struct Done {
-    index: usize,
-    records: u64,
-    outputs: [Vec<u8>; SLOTS],
-    stats: RunStats,
-}
-
-fn process_job(s: &Settings, job: Job) -> Result<Done> {
+fn process_chunk(s: &Settings, r1: &Chunk, r2: Option<&Chunk>) -> Result<(Vec<Vec<u8>>, RunStats)> {
     let mut st = RunStats::default();
     let mut out: [Vec<u8>; SLOTS] = Default::default();
-    match &job.r2 {
+    match r2 {
         None => {
-            for rec in job.r1.iter() {
+            for rec in r1.iter() {
                 process_single(s, &rec, &mut st, &mut out);
             }
         }
         Some(r2) => {
             let mut rc_buf = Vec::new();
-            for i in 0..job.r1.len() {
-                let (a, b) = (job.r1.get(i), r2.get(i));
+            for i in 0..r1.len() {
+                let (a, b) = (r1.get(i), r2.get(i));
                 if s.check_names && !mate_names_match(&a, &b) {
                     return Err(format!(
-                        "read names of pair {} do not match: '{}' (R1) vs '{}' (R2); \
-                         the files may be out of sync (use --no-name-check to skip this check)",
-                        job.r1.first_record + i as u64 + 1,
+                        "read names of pair {} do not match: '{}' (R1) vs '{}' (R2);                          the files may be out of sync (use --no-name-check to skip this check)",
+                        r1.first_record + i as u64 + 1,
                         String::from_utf8_lossy(a.id()),
                         String::from_utf8_lossy(b.id()),
                     ));
@@ -700,243 +650,7 @@ fn process_job(s: &Settings, job: Job) -> Result<Done> {
             }
         }
     }
-    for (slot, data) in out.iter_mut().enumerate() {
-        if s.gz[slot] && !data.is_empty() {
-            *data = gzip_member(data, s.compression_level);
-        }
-    }
-    Ok(Done {
-        index: job.index,
-        records: job.r1.len() as u64,
-        outputs: out,
-        stats: st,
-    })
-}
-
-/// An output file being written.
-struct Sink {
-    file: File,
-    path: PathBuf,
-    gz: bool,
-    written: u64,
-}
-
-impl Sink {
-    fn write(&mut self, data: &[u8]) -> Result<()> {
-        self.file
-            .write_all(data)
-            .map_err(|e| format!("cannot write {}: {e}", self.path.display()))?;
-        self.written += data.len() as u64;
-        Ok(())
-    }
-
-    fn finish(mut self) -> Result<()> {
-        if self.gz && self.written == 0 {
-            // an empty file is not valid gzip; write an empty member instead
-            self.write(&gzip_member(b"", 1))?;
-        }
-        self.file
-            .flush()
-            .map_err(|e| format!("cannot write {}: {e}", self.path.display()))
-    }
-}
-
-/// Periodic progress reports from the writer thread.
-struct Progress<'a> {
-    log: &'a Logger,
-    interval: Option<Duration>,
-    start: Instant,
-    last: Instant,
-    unit: &'static str,
-    bytes_read: Arc<AtomicU64>,
-    file_size: u64,
-}
-
-impl Progress<'_> {
-    fn update(&mut self, records: u64) {
-        let Some(interval) = self.interval else {
-            return;
-        };
-        if self.last.elapsed() < interval {
-            return;
-        }
-        self.last = Instant::now();
-        let secs = self.start.elapsed().as_secs_f64().max(1e-9);
-        let rate = records as f64 / secs;
-        let fraction = (self.file_size > 0).then(|| {
-            (self.bytes_read.load(Ordering::Relaxed) as f64 / self.file_size as f64).min(1.0)
-        });
-        let pct = fraction
-            .map(|f| format!(" ({:.1}% of input)", f * 100.0))
-            .unwrap_or_default();
-        self.log.progress(
-            &format!(
-                "processed {} {}{pct}, {} {}/s",
-                group(records),
-                self.unit,
-                group(rate as u64),
-                self.unit
-            ),
-            json!({
-                "records": records,
-                "unit": self.unit,
-                "input_fraction": fraction.map(|f| (f * 10000.0).round() / 10000.0),
-                "records_per_s": rate.round(),
-            }),
-        );
-    }
-}
-
-fn write_loop(
-    rx: Receiver<Result<Done>>,
-    tokens: SyncSender<()>,
-    mut sinks: Vec<Option<Sink>>,
-    mut progress: Progress,
-) -> Result<(RunStats, u64)> {
-    let mut pending: BTreeMap<usize, Done> = BTreeMap::new();
-    let mut next = 0;
-    let mut stats = RunStats::default();
-    let mut records = 0u64;
-    for msg in rx {
-        let done = msg?;
-        pending.insert(done.index, done);
-        while let Some(done) = pending.remove(&next) {
-            for (slot, data) in done.outputs.iter().enumerate() {
-                if !data.is_empty() {
-                    sinks[slot]
-                        .as_mut()
-                        .expect("output slot without file")
-                        .write(data)?;
-                }
-            }
-            stats.merge(&done.stats);
-            records += done.records;
-            next += 1;
-            let _ = tokens.send(());
-            progress.update(records);
-        }
-    }
-    for sink in sinks.into_iter().flatten() {
-        sink.finish()?;
-    }
-    Ok((stats, records))
-}
-
-fn receive(rx: Option<&Receiver<Result<Chunk>>>) -> Result<Option<Chunk>> {
-    match rx.map(|rx| rx.recv()) {
-        Some(Ok(chunk)) => chunk.map(Some),
-        _ => Ok(None),
-    }
-}
-
-/// Runs the reader → workers → writer pipeline.
-fn run_pipeline(
-    s: &Settings,
-    args: &ShortArgs,
-    threads: usize,
-    sinks: Vec<Option<Sink>>,
-    log: &Logger,
-) -> Result<(RunStats, u64)> {
-    let in1 = io::open_fastq(&args.r1, "R1")?;
-    let in2 = args
-        .r2
-        .as_deref()
-        .map(|p| io::open_fastq(p, "R2"))
-        .transpose()?;
-    let pool = rayon::ThreadPoolBuilder::new()
-        .num_threads(threads)
-        .thread_name(|i| format!("simpletrim-worker-{i}"))
-        .build()
-        .map_err(|e| format!("cannot start worker threads: {e}"))?;
-    let max_in_flight = threads * 2 + 2;
-    let progress = Progress {
-        log,
-        // zero, negative, NaN or out-of-range values disable progress reports
-        interval: Duration::try_from_secs_f64(args.progress_interval)
-            .ok()
-            .filter(|d| !d.is_zero()),
-        start: Instant::now(),
-        last: Instant::now(),
-        unit: if s.paired { "pairs" } else { "reads" },
-        bytes_read: in1.bytes_read.clone(),
-        file_size: in1.file_size,
-    };
-
-    std::thread::scope(|scope| {
-        let (tx1, rx1) = sync_channel(max_in_flight);
-        let r1_thread =
-            scope.spawn(move || feed_chunks(in1.reader, tx1, args.max_reads, CHUNK_RECORDS));
-        let (rx2, r2_thread) = match in2 {
-            Some(in2) => {
-                let (tx2, rx2) = sync_channel(max_in_flight);
-                let t = scope
-                    .spawn(move || feed_chunks(in2.reader, tx2, args.max_reads, CHUNK_RECORDS));
-                (Some(rx2), Some(t))
-            }
-            None => (None, None),
-        };
-        let (done_tx, done_rx) = channel::<Result<Done>>();
-        let (token_tx, token_rx) = sync_channel::<()>(max_in_flight);
-        for _ in 0..max_in_flight {
-            token_tx.send(()).expect("token channel has capacity");
-        }
-        let writer = scope.spawn(move || write_loop(done_rx, token_tx, sinks, progress));
-
-        let mut dispatch_error = None;
-        pool.in_place_scope(|ps| {
-            let mut index = 0;
-            loop {
-                if token_rx.recv().is_err() {
-                    break; // the writer stopped (with an error)
-                }
-                let next = receive(Some(&rx1)).and_then(|c1| Ok((c1, receive(rx2.as_ref())?)));
-                let job = match next {
-                    Err(e) => Err(e),
-                    Ok((None, None)) => break,
-                    Ok((Some(r1), None)) if !s.paired => Ok(Job { index, r1, r2: None }),
-                    Ok((Some(r1), Some(r2))) if r1.len() == r2.len() => Ok(Job { index, r1, r2: Some(r2) }),
-                    Ok((c1, c2)) => {
-                        let reads = |c: &Option<Chunk>, other: &Option<Chunk>| match (c, other) {
-                            (Some(c), _) => c.first_record + c.len() as u64,
-                            (None, Some(o)) => o.first_record,
-                            (None, None) => 0,
-                        };
-                        let (n1, n2) = (reads(&c1, &c2), reads(&c2, &c1));
-                        let (shorter, n) = if n1 < n2 { ("R1", n1) } else { ("R2", n2) };
-                        Err(format!(
-                            "R1 and R2 have different numbers of reads: {shorter} ended after {} reads",
-                            group(n)
-                        ))
-                    }
-                };
-                match job {
-                    Ok(job) => {
-                        let tx = done_tx.clone();
-                        ps.spawn(move |_| {
-                            let _ = tx.send(process_job(s, job));
-                        });
-                        index += 1;
-                    }
-                    Err(e) => {
-                        dispatch_error = Some(e);
-                        break;
-                    }
-                }
-            }
-        });
-        drop(done_tx);
-        drop(rx1);
-        drop(rx2);
-        let written = writer.join().expect("writer thread panicked");
-        r1_thread.join().expect("reader thread panicked");
-        if let Some(t) = r2_thread {
-            t.join().expect("reader thread panicked");
-        }
-        match dispatch_error {
-            Some(e) => Err(e),
-            None => written,
-        }
-    })
+    Ok((out.into(), st))
 }
 
 fn describe_settings(s: &Settings) -> (Vec<String>, Value) {
@@ -983,6 +697,10 @@ fn describe_settings(s: &Settings) -> (Vec<String>, Value) {
     lines.push(match s.poly_g {
         Some(n) => format!("poly-G trimming: on, min length {n} ({})", s.poly_g_reason),
         None => format!("poly-G trimming: off ({})", s.poly_g_reason),
+    });
+    lines.push(match s.poly_x {
+        Some(n) => format!("poly-X trimming: on, min length {n}"),
+        None => "poly-X trimming: off".into(),
     });
     let mut adapter_json = Value::Null;
     match &s.adapter {
@@ -1077,6 +795,7 @@ fn describe_settings(s: &Settings) -> (Vec<String>, Value) {
         "cut_tail": s.cut.tail.filter(|_| s.cut.right.is_none()).map(|w| json!({"window": w.size, "quality": w.quality})),
         "cut_right": s.cut.right.map(|w| json!({"window": w.size, "quality": w.quality})),
         "poly_g": { "enabled": s.poly_g.is_some(), "min_len": s.poly_g, "reason": s.poly_g_reason },
+        "poly_x": { "enabled": s.poly_x.is_some(), "min_len": s.poly_x },
         "adapter": adapter_json,
         "dimer_max_len": s.dimer_max_len,
         "quality_filter": s.quality_filter.map(|q| json!({
@@ -1191,6 +910,7 @@ fn summary(s: &Settings, args: &ShortArgs, st: &RunStats, elapsed: f64) -> (Stri
             &tr[1].quality_window,
         ),
         ("poly-G", &tr[0].poly_g, &tr[1].poly_g),
+        ("poly-X", &tr[0].poly_x, &tr[1].poly_x),
         ("adapter", &tr[0].adapter, &tr[1].adapter),
     ] {
         if s.paired {
@@ -1296,16 +1016,29 @@ pub fn run(args: &ShortArgs, threads: usize, log: &Logger) -> Result<()> {
     ];
     for (slot, path) in outputs {
         if let Some(path) = path {
-            sinks[slot] = Some(Sink {
-                file: files.create(path, args.force)?,
-                path: path.clone(),
-                gz: settings.gz[slot],
-                written: 0,
-            });
+            sinks[slot] = Some(Sink::create(&mut files, path, args.force)?);
         }
     }
 
-    let (stats, _) = run_pipeline(&settings, args, threads, sinks, log)?;
+    let options = pipeline::Options {
+        threads,
+        max_reads: args.max_reads,
+        chunk_records: CHUNK_RECORDS,
+        chunk_bytes: usize::MAX,
+        progress_interval: args.progress_interval,
+        unit: if settings.paired { "pairs" } else { "reads" },
+        compression_level: settings.compression_level,
+        log,
+    };
+    let in1 = io::open_fastq(&args.r1, "R1")?;
+    let in2 = args
+        .r2
+        .as_deref()
+        .map(|p| io::open_fastq(p, "R2"))
+        .transpose()?;
+    let stats = pipeline::run(&options, in1, in2, sinks, |r1, r2| {
+        process_chunk(&settings, r1, r2)
+    })?;
     let elapsed = log.elapsed_secs();
     let (text, mut json) = summary(&settings, args, &stats, elapsed);
     json["settings"] = settings_json;
