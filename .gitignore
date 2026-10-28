@@ -1,4 +1,6 @@
 
+examples/
+
 # Python-generated files
 __pycache__/
 *.py[oc]
@@ -138,9 +140,6 @@ docs/.doctrees/
 *.synctex.gz
 *.toc
 
-# md files
-*.md
-!README.md
 
 # TXT files
 *.txt
